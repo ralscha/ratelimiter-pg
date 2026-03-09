@@ -1,0 +1,101 @@
+package ratelimit
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+func TestRateLimiterAllow_RejectsImpossibleCost(t *testing.T) {
+	limiter := &RateLimiter{}
+
+	_, err := limiter.Allow(context.Background(), "user:a", BucketConfig{
+		Capacity:        1,
+		RefillPerSecond: 1,
+		CostPerRequest:  2,
+		DenyRetryFloor:  time.Second,
+	})
+	if err == nil {
+		t.Fatal("expected invalid bucket config error")
+	}
+}
+
+func TestRateLimiterAllow_RejectsEmptyKey(t *testing.T) {
+	limiter := &RateLimiter{}
+
+	_, err := limiter.Allow(context.Background(), "   ", BucketConfig{
+		Capacity:        1,
+		RefillPerSecond: 1,
+		CostPerRequest:  1,
+		DenyRetryFloor:  time.Second,
+	})
+	if err == nil {
+		t.Fatal("expected empty key validation error")
+	}
+}
+
+func TestRateLimiterDeleteStaleBuckets_RejectsNonPositiveTTL(t *testing.T) {
+	limiter := &RateLimiter{}
+
+	if _, err := limiter.DeleteStaleBuckets(context.Background(), 0); err == nil {
+		t.Fatal("expected ttl validation error")
+	}
+}
+
+func TestRateLimiterInit_RejectsNilDB(t *testing.T) {
+	limiter := &RateLimiter{}
+
+	err := limiter.Init(context.Background())
+	if !errors.Is(err, errNilDB) {
+		t.Fatalf("Init error = %v, want %v", err, errNilDB)
+	}
+}
+
+func TestCurrentSchemaVersionValue(t *testing.T) {
+	if got := currentSchemaVersionValue(); got != 2 {
+		t.Fatalf("currentSchemaVersionValue() = %d, want 2", got)
+	}
+}
+
+func TestRateLimiterSchemaName_DefaultAndCustom(t *testing.T) {
+	if got := (&RateLimiter{}).schemaName(); got != defaultSchemaName {
+		t.Fatalf("default schema name = %q, want %q", got, defaultSchemaName)
+	}
+
+	if got := (&RateLimiter{Schema: " tenant_limits "}).schemaName(); got != "tenant_limits" {
+		t.Fatalf("custom schema name = %q, want %q", got, "tenant_limits")
+	}
+}
+
+func TestRateLimiterRenderMigrationSQL(t *testing.T) {
+	limiter := &RateLimiter{Schema: `tenant"limits`}
+
+	got := limiter.renderMigrationSQL("CREATE TABLE {{schema}}.items(id INT)")
+	want := `CREATE TABLE "tenant""limits".items(id INT)`
+	if got != want {
+		t.Fatalf("renderMigrationSQL() = %q, want %q", got, want)
+	}
+}
+
+func TestDenyRetryFloorMillis(t *testing.T) {
+	tests := []struct {
+		name string
+		in   time.Duration
+		want int64
+	}{
+		{name: "non-positive", in: 0, want: 0},
+		{name: "negative", in: -1 * time.Millisecond, want: 0},
+		{name: "sub-millisecond rounds up", in: 500 * time.Microsecond, want: 1},
+		{name: "whole milliseconds preserved", in: 1500 * time.Microsecond, want: 1},
+		{name: "multi-millisecond preserved", in: 25 * time.Millisecond, want: 25},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := denyRetryFloorMillis(tt.in); got != tt.want {
+				t.Fatalf("denyRetryFloorMillis(%s) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}

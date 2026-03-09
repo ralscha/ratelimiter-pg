@@ -1,0 +1,52 @@
+version: '3'
+
+tasks:
+  pg-up:
+    desc: Create and start PostgreSQL container
+    cmds:
+      - docker compose up -d postgresql
+
+  pg-stop:
+    desc: Stop PostgreSQL container
+    cmds:
+      - docker compose stop postgresql
+
+  pg-reset:
+    desc: Recreate PostgreSQL container and remove old compose volumes
+    cmds:
+      - docker compose down -v --remove-orphans
+      - docker compose up -d --force-recreate postgresql
+
+  run:
+    desc: Run the basic library example
+    deps: [pg-up]
+    cmds:
+      - go run ./examples/basic
+
+  lint:
+    desc: Run golangci-lint in Docker
+    cmds:
+      - docker run --rm -v "${PWD}:/app" -w /app golangci/golangci-lint:v2.10.1 golangci-lint run -v --timeout=10m
+
+  test:
+    desc: Run Go tests
+    cmds:
+      - go test ./...
+
+  format:
+    desc: Format Go code
+    cmds:
+      - go fix ./...
+      - go fmt ./...
+
+  serve:
+    desc: Run HTTP login example
+    deps: [pg-up]
+    cmds:
+      - go run ./examples/http-login
+
+  cleanup:
+    desc: Run stale bucket cleanup example
+    deps: [pg-up]
+    cmds:
+      - go run ./examples/cleanup

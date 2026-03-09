@@ -1,0 +1,18 @@
+services:
+  postgresql:
+    image: postgres:18-alpine
+    container_name: ratelimit-postgres
+    environment:
+      POSTGRES_DB: ratelimit
+      POSTGRES_USER: ratelimit
+      POSTGRES_PASSWORD: ratelimit
+    ports:
+      - "5432:5432"
+    # PostgreSQL 18+ expects versioned data directories under /var/lib/postgresql.
+    tmpfs:
+      - /var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ratelimit -d ratelimit"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
