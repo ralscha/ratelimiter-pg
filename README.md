@@ -2,7 +2,7 @@
 
 `github.com/ralscha/ratelimiter-pg` is a PostgreSQL-backed token-bucket rate-limiting library for Go.
 
-It stores bucket state in PostgreSQL, evaluates each request with one stored function call, and keeps the public API intentionally small.
+It stores bucket state in PostgreSQL and evaluates each request with one stored function call.
 
 ## Install
 
@@ -57,17 +57,17 @@ func main() {
 Minimal request flow:
 
 1. Open a PostgreSQL connection pool.
-2. Construct `RateLimiter` with the pool and schema name.
+2. Construct `RateLimiter` with the pool. Leave `Schema` empty to use `public`, or set it to target a different schema.
 3. Call `Init` once during startup.
 4. Call `Allow` for each key you want to throttle.
 
 ## Public API
 
-- `RateLimiter` holds the PostgreSQL pool and target schema.
-- `BucketConfig` defines capacity, refill rate, cost, and deny retry floor.
+- `RateLimiter` holds the PostgreSQL pool and target schema. An empty `Schema` value defaults to `public`.
+- `BucketConfig` defines capacity, refill rate, cost, and deny retry floor. `Capacity`, `RefillPerSecond`, and `CostPerRequest` must be `> 0`, and `CostPerRequest` must not exceed `Capacity`.
 - `Decision` reports whether a request was allowed, how many tokens remain, and when to retry.
 - `(*RateLimiter).Init` prepares the limiter for use.
-- `(*RateLimiter).Allow` evaluates one key and returns a `Decision`.
+- `(*RateLimiter).Allow` evaluates one key and returns a `Decision`. It trims leading and trailing whitespace from the key and rejects an empty result.
 - `(*RateLimiter).DeleteStaleBuckets` deletes untouched buckets older than a TTL.
 
 ## Schema management
@@ -77,15 +77,10 @@ Minimal request flow:
 - `(*RateLimiter).Init` checks the current schema state and applies pending migrations when needed.
 - On a fresh database, `Init` creates the limiter objects and installs the embedded schema.
 - On an existing but outdated database, `Init` upgrades the limiter schema to the version required by the library.
+- If the database schema version is newer than the library supports, `Init` returns an error instead of downgrading or modifying it.
 - On a database that is already current, `Init` returns without applying changes.
 - Set `RateLimiter.Schema` when you want the limiter objects in a schema other than `public`.
 
-The embedded SQL files live under `sql/`:
-
-```text
-001_init.sql
-002_check_rate_limit_v1.sql
-```
 
 ## Examples
 
@@ -93,7 +88,7 @@ Runnable examples live under `examples/`:
 
 - `examples/basic` shows the smallest end-to-end limiter setup.
 - `examples/http-login` shows a login endpoint that returns `Retry-After` when throttled.
-- `examples/cleanup` shows how to delete stale bucket rows after the schema is already installed.
+- `examples/cleanup` shows how to delete stale bucket rows. Like the other examples, it still calls `Init` during startup.
 
 All examples use these environment variables when present:
 
@@ -101,6 +96,13 @@ All examples use these environment variables when present:
 - `DB_SCHEMA` for a non-default schema name.
 - `LISTEN_ADDR` for the HTTP example.
 - `STALE_TTL` for the cleanup example.
+
+If unset, the examples default to the PostgreSQL settings from `docker-compose.yml`:
+
+- `DATABASE_URL=postgres://ratelimit:ratelimit@localhost:5432/ratelimit?sslmode=disable`
+- `DB_SCHEMA=public`
+- `LISTEN_ADDR=:8080`
+- `STALE_TTL=24h`
 
 Run them with:
 
@@ -123,13 +125,15 @@ db:read_table_query
 tenant:acme:write
 ```
 
-The library does not interpret key structure. It only trims leading and trailing whitespace.
+The library does not interpret key structure or normalize case. It only trims leading and trailing whitespace.
 
 That makes it suitable for per-user login throttling, per-tenant quotas, per-endpoint limits, or any other string-addressable bucket strategy chosen by the application.
 
 ## How it works
 
-The PostgreSQL function `check_rate_limit` validates the request configuration, normalizes the key, replenishes tokens lazily from elapsed time, and atomically applies the allow-or-deny decision through one `INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING` statement.
+`(*RateLimiter).Allow` validates the bucket configuration, trims leading and trailing whitespace from the key, and then calls the PostgreSQL function `check_rate_limit`.
+
+That function replenishes tokens lazily from elapsed time and atomically applies the allow-or-deny decision through one `INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING` statement.
 
 Because the decision is stored and computed in PostgreSQL, competing requests for the same bucket serialize on the same row instead of relying on in-process memory or distributed locks.
 
@@ -143,20 +147,32 @@ The deny retry floor is then applied so very small retry values still surface as
 
 ## Database objects
 
-`Init` creates a bucket table and stored function in the configured schema:
+`Init` creates these objects in the configured schema:
 
 ```sql
+CREATE TABLE public.rate_limit_schema_migrations (
+	version     BIGINT PRIMARY KEY,
+	name        TEXT NOT NULL,
+	applied_at  TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
+);
+
 CREATE TABLE public.rate_limit_buckets (
-    bucket_key  TEXT PRIMARY KEY,
-    tokens      DOUBLE PRECISION NOT NULL,
-    updated_at  TIMESTAMPTZ NOT NULL
+	bucket_key  TEXT PRIMARY KEY,
+	tokens      DOUBLE PRECISION NOT NULL,
+	updated_at  TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX idx_rlb_updated_at ON public.rate_limit_buckets (updated_at);
+
+CREATE OR REPLACE FUNCTION public.check_rate_limit(...)
 ```
+
+The `rate_limit_schema_migrations` table records which embedded migrations have been applied.
 
 The `updated_at` index supports `DeleteStaleBuckets`, which removes rows that have not been touched for a configurable TTL.
 
 ## Status codes and retries
 
-The library itself is transport-agnostic. It returns a `Decision` with `Allowed`, `TokensLeft`, and `RetryAfter`, and the caller decides how that maps to HTTP responses, gRPC errors, CLI behavior, or background job scheduling.
+The library is transport-agnostic. It returns a `Decision` with `Allowed`, `TokensLeft`, and `RetryAfter`, and the caller decides how that maps to HTTP responses, gRPC errors, CLI behavior, or background job scheduling.
+
+
