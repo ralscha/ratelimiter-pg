@@ -18,11 +18,11 @@ Call `Init` once during application startup. It is the library's single bootstra
 package main
 
 import (
-    "context"
-    "log"
-    "time"
+	"context"
+	"log"
+	"time"
 
-    "github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgxpool"
 	ratelimit "github.com/ralscha/ratelimiter-pg"
 )
 
@@ -34,18 +34,18 @@ func main() {
 	}
 	defer db.Close()
 
-	limiter := &ratelimit.RateLimiter{DB: db, Schema: "public"}
-
-	if err := limiter.Init(ctx); err != nil {
-		log.Fatal(err)
-	}
-
-	decision, err := limiter.Allow(ctx, "login:user:alice", ratelimit.BucketConfig{
+	limiter := ratelimit.New(db, "public", ratelimit.BucketConfig{
 		Capacity:        5,
 		RefillPerSecond: 1.0 / 60.0,
 		CostPerRequest:  1,
 		DenyRetryFloor:  time.Second,
 	})
+
+	if err := limiter.Init(ctx); err != nil {
+		log.Fatal(err)
+	}
+
+	decision, err := limiter.Allow(ctx, "login:user:alice")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -54,20 +54,34 @@ func main() {
 }
 ```
 
+When one request needs different settings than the limiter default, call `AllowWithConfig`:
+
+```go
+decision, err := limiter.AllowWithConfig(ctx, "login:user:alice", ratelimit.BucketConfig{
+	Capacity:        10,
+	RefillPerSecond: 1,
+	CostPerRequest:  2,
+	DenyRetryFloor:  time.Second,
+})
+```
+
 Minimal request flow:
 
 1. Open a PostgreSQL connection pool.
-2. Construct `RateLimiter` with the pool. Leave `Schema` empty to use `public`, or set it to target a different schema.
+2. Construct `RateLimiter` with the pool and default bucket config. Leave `Schema` empty to use `public`, or set it to target a different schema.
 3. Call `Init` once during startup.
-4. Call `Allow` for each key you want to throttle.
+4. Call `Allow` for each key you want to throttle, or `AllowWithConfig` when one call needs a different bucket config.
 
 ## Public API
 
-- `RateLimiter` holds the PostgreSQL pool and target schema. An empty `Schema` value defaults to `public`.
+- `New` constructs a `RateLimiter` with a PostgreSQL pool, target schema, and default bucket config.
+- `RateLimiter` holds the PostgreSQL pool, target schema, and default bucket config. An empty `Schema` value defaults to `public`.
+- `RateLimiter.DefaultConfig` is the bucket config used by `(*RateLimiter).Allow`.
 - `BucketConfig` defines capacity, refill rate, cost, and deny retry floor. `Capacity`, `RefillPerSecond`, and `CostPerRequest` must be `> 0`, and `CostPerRequest` must not exceed `Capacity`.
 - `Decision` reports whether a request was allowed, how many tokens remain, and when to retry.
 - `(*RateLimiter).Init` prepares the limiter for use.
-- `(*RateLimiter).Allow` evaluates one key and returns a `Decision`. It trims leading and trailing whitespace from the key and rejects an empty result.
+- `(*RateLimiter).Allow` evaluates one key with the limiter's default bucket config. It trims leading and trailing whitespace from the key and rejects an empty result.
+- `(*RateLimiter).AllowWithConfig` evaluates one key with a call-specific bucket config override.
 - `(*RateLimiter).DeleteStaleBuckets` deletes untouched buckets older than a TTL.
 
 ## Schema management
@@ -131,7 +145,9 @@ That makes it suitable for per-user login throttling, per-tenant quotas, per-end
 
 ## How it works
 
-`(*RateLimiter).Allow` validates the bucket configuration, trims leading and trailing whitespace from the key, and then calls the PostgreSQL function `check_rate_limit`.
+`(*RateLimiter).Allow` validates `RateLimiter.DefaultConfig`, trims leading and trailing whitespace from the key, and then calls the PostgreSQL function `check_rate_limit`.
+
+Use `(*RateLimiter).AllowWithConfig` when a specific request should override that default configuration.
 
 That function replenishes tokens lazily from elapsed time and atomically applies the allow-or-deny decision through one `INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING` statement.
 

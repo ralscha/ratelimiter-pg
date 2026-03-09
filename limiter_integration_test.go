@@ -144,7 +144,7 @@ func TestRateLimiterInit_CustomSchema(t *testing.T) {
 		t.Fatalf("init custom schema: %v", err)
 	}
 
-	decision, err := limiter.Allow(ctx, "custom:user", BucketConfig{
+	decision, err := limiter.AllowWithConfig(ctx, "custom:user", BucketConfig{
 		Capacity:        1,
 		RefillPerSecond: 1,
 		CostPerRequest:  1,
@@ -181,7 +181,7 @@ func TestRateLimiterAllow_DeniesWhenBucketExhausted(t *testing.T) {
 	}
 	key := "user:alice"
 
-	first, err := limiter.Allow(ctx, key, cfg)
+	first, err := limiter.AllowWithConfig(ctx, key, cfg)
 	if err != nil {
 		t.Fatalf("first call: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestRateLimiterAllow_DeniesWhenBucketExhausted(t *testing.T) {
 		t.Fatalf("expected first call tokens_left near 1.0, got %f", first.TokensLeft)
 	}
 
-	second, err := limiter.Allow(ctx, key, cfg)
+	second, err := limiter.AllowWithConfig(ctx, key, cfg)
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestRateLimiterAllow_DeniesWhenBucketExhausted(t *testing.T) {
 		t.Fatalf("expected second call tokens_left to stay below one full token, got %f", second.TokensLeft)
 	}
 
-	third, err := limiter.Allow(ctx, key, cfg)
+	third, err := limiter.AllowWithConfig(ctx, key, cfg)
 	if err != nil {
 		t.Fatalf("third call: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestRateLimiterAllow_ConcurrentFirstHitSingleAllow(t *testing.T) {
 	for range workers {
 		go func() {
 			defer wg.Done()
-			decision, err := limiter.Allow(ctx, "concurrent:key", cfg)
+			decision, err := limiter.AllowWithConfig(ctx, "concurrent:key", cfg)
 			if err != nil {
 				t.Errorf("allow error: %v", err)
 				return
@@ -282,7 +282,7 @@ func TestRateLimiterAllow_ConcurrentFirstHitAlwaysReturnsDecision(t *testing.T) 
 			go func() {
 				defer wg.Done()
 
-				decision, err := limiter.Allow(ctx, key, cfg)
+				decision, err := limiter.AllowWithConfig(ctx, key, cfg)
 				if err != nil {
 					errs <- err
 					return
@@ -329,7 +329,7 @@ func TestRateLimiterAllow_NormalizesKey(t *testing.T) {
 		DenyRetryFloor:  time.Second,
 	}
 
-	first, err := limiter.Allow(ctx, "  user:a  ", cfg)
+	first, err := limiter.AllowWithConfig(ctx, "  user:a  ", cfg)
 	if err != nil {
 		t.Fatalf("first allow: %v", err)
 	}
@@ -337,12 +337,72 @@ func TestRateLimiterAllow_NormalizesKey(t *testing.T) {
 		t.Fatalf("first normalized request should be allowed")
 	}
 
-	second, err := limiter.Allow(ctx, "user:a", cfg)
+	second, err := limiter.AllowWithConfig(ctx, "user:a", cfg)
 	if err != nil {
 		t.Fatalf("second allow: %v", err)
 	}
 	if second.Allowed {
 		t.Fatalf("expected second request against normalized key to be denied")
+	}
+}
+
+func TestRateLimiterAllow_UsesDefaultConfig(t *testing.T) {
+	ctx := context.Background()
+	limiter := setupTestLimiter(t)
+	limiter.DefaultConfig = BucketConfig{
+		Capacity:        1,
+		RefillPerSecond: 0.001,
+		CostPerRequest:  1,
+		DenyRetryFloor:  10 * time.Millisecond,
+	}
+
+	first, err := limiter.Allow(ctx, "default:user")
+	if err != nil {
+		t.Fatalf("first allow: %v", err)
+	}
+	if !first.Allowed {
+		t.Fatal("expected first default-config request to be allowed")
+	}
+
+	second, err := limiter.Allow(ctx, "default:user")
+	if err != nil {
+		t.Fatalf("second allow: %v", err)
+	}
+	if second.Allowed {
+		t.Fatal("expected second default-config request to be denied")
+	}
+}
+
+func TestRateLimiterAllowWithConfig_OverridesDefault(t *testing.T) {
+	ctx := context.Background()
+	limiter := setupTestLimiter(t)
+	limiter.DefaultConfig = BucketConfig{
+		Capacity:        5,
+		RefillPerSecond: 1,
+		CostPerRequest:  1,
+		DenyRetryFloor:  time.Second,
+	}
+	override := BucketConfig{
+		Capacity:        1,
+		RefillPerSecond: 0.001,
+		CostPerRequest:  1,
+		DenyRetryFloor:  10 * time.Millisecond,
+	}
+
+	first, err := limiter.AllowWithConfig(ctx, "override:user", override)
+	if err != nil {
+		t.Fatalf("first allow: %v", err)
+	}
+	if !first.Allowed {
+		t.Fatal("expected first override-config request to be allowed")
+	}
+
+	second, err := limiter.AllowWithConfig(ctx, "override:user", override)
+	if err != nil {
+		t.Fatalf("second allow: %v", err)
+	}
+	if second.Allowed {
+		t.Fatal("expected second override-config request to be denied")
 	}
 }
 

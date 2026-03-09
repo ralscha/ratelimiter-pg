@@ -21,17 +21,17 @@ func main() {
 	}
 	defer db.Close()
 
-	limiter := &ratelimit.RateLimiter{DB: db, Schema: getenv("DB_SCHEMA", "public")}
-	if err := limiter.Init(ctx); err != nil {
-		log.Fatalf("init limiter: %v", err)
-	}
-
-	decision, err := limiter.Allow(ctx, "login:user:alice", ratelimit.BucketConfig{
+	limiter := ratelimit.New(db, getenv("DB_SCHEMA", "public"), ratelimit.BucketConfig{
 		Capacity:        5,
 		RefillPerSecond: 1.0 / 60.0,
 		CostPerRequest:  1,
 		DenyRetryFloor:  time.Second,
 	})
+	if err := limiter.Init(ctx); err != nil {
+		log.Fatalf("init limiter: %v", err)
+	}
+
+	decision, err := limiter.Allow(ctx, "login:user:alice")
 	if err != nil {
 		log.Fatalf("allow: %v", err)
 	}

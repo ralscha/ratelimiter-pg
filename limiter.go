@@ -12,8 +12,18 @@ import (
 
 // RateLimiter applies token-bucket decisions backed by PostgreSQL state.
 type RateLimiter struct {
-	DB     *pgxpool.Pool
-	Schema string
+	DB            *pgxpool.Pool
+	Schema        string
+	DefaultConfig BucketConfig
+}
+
+// New constructs a RateLimiter with an optional default bucket config.
+func New(db *pgxpool.Pool, schema string, defaultConfig BucketConfig) *RateLimiter {
+	return &RateLimiter{
+		DB:            db,
+		Schema:        schema,
+		DefaultConfig: defaultConfig,
+	}
 }
 
 // BucketConfig describes one logical bucket configuration.
@@ -30,6 +40,11 @@ type Decision struct {
 	TokensLeft float64
 	RetryAfter time.Duration
 }
+
+var (
+	errInvalidBucketConfig = errors.New("invalid bucket config")
+	errEmptyBucketKey      = errors.New("at least one bucket key is required")
+)
 
 // Init prepares the limiter for use by applying embedded migrations and
 // verifying schema compatibility.
@@ -53,24 +68,28 @@ func (r *RateLimiter) Init(ctx context.Context) error {
 	return r.install(ctx)
 }
 
-// Allow checks whether one request is allowed for key using cfg.
-func (r *RateLimiter) Allow(ctx context.Context, key string, cfg BucketConfig) (Decision, error) {
-	if err := r.validate(); err != nil {
+// Allow checks whether one request is allowed for key using the limiter's default config.
+func (r *RateLimiter) Allow(ctx context.Context, key string) (Decision, error) {
+	return r.AllowWithConfig(ctx, key, r.DefaultConfig)
+}
+
+// AllowWithConfig checks whether one request is allowed for key using cfg.
+func (r *RateLimiter) AllowWithConfig(ctx context.Context, key string, cfg BucketConfig) (Decision, error) {
+	normalized, err := normalizeBucketKey(key)
+	if err != nil {
 		return Decision{}, err
 	}
-
-	normalized := strings.TrimSpace(key)
-	if cfg.Capacity <= 0 || cfg.RefillPerSecond <= 0 || cfg.CostPerRequest <= 0 || cfg.CostPerRequest > cfg.Capacity {
-		return Decision{}, errors.New("invalid bucket config")
+	if err := validateBucketConfig(cfg); err != nil {
+		return Decision{}, err
 	}
-	if normalized == "" {
-		return Decision{}, errors.New("at least one bucket key is required")
+	if err := r.validate(); err != nil {
+		return Decision{}, err
 	}
 
 	var allowed bool
 	var tokensLeft float64
 	var retryAfterMS int64
-	err := r.DB.QueryRow(ctx, fmt.Sprintf(`
+	err = r.DB.QueryRow(ctx, fmt.Sprintf(`
 SELECT out_allowed AS allowed,
 	out_tokens_left AS tokens_left,
 	out_retry_after_ms AS retry_after_ms
@@ -89,12 +108,11 @@ FROM %s($1, $2, $3, $4, $5)
 
 // DeleteStaleBuckets removes bucket rows untouched for longer than ttl.
 func (r *RateLimiter) DeleteStaleBuckets(ctx context.Context, ttl time.Duration) (int64, error) {
-	if err := r.validate(); err != nil {
-		return 0, err
-	}
-
 	if ttl <= 0 {
 		return 0, errors.New("ttl must be > 0")
+	}
+	if err := r.validate(); err != nil {
+		return 0, err
 	}
 	result, err := r.DB.Exec(ctx, fmt.Sprintf(`
 DELETE FROM %s
@@ -115,4 +133,19 @@ func denyRetryFloorMillis(d time.Duration) int64 {
 		return 1
 	}
 	return ms
+}
+
+func validateBucketConfig(cfg BucketConfig) error {
+	if cfg.Capacity <= 0 || cfg.RefillPerSecond <= 0 || cfg.CostPerRequest <= 0 || cfg.CostPerRequest > cfg.Capacity {
+		return errInvalidBucketConfig
+	}
+	return nil
+}
+
+func normalizeBucketKey(key string) (string, error) {
+	normalized := strings.TrimSpace(key)
+	if normalized == "" {
+		return "", errEmptyBucketKey
+	}
+	return normalized, nil
 }

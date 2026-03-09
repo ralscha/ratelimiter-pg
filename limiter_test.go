@@ -10,36 +10,60 @@ import (
 func TestRateLimiterAllow_RejectsImpossibleCost(t *testing.T) {
 	limiter := &RateLimiter{}
 
-	_, err := limiter.Allow(context.Background(), "user:a", BucketConfig{
+	_, err := limiter.AllowWithConfig(context.Background(), "user:a", BucketConfig{
 		Capacity:        1,
 		RefillPerSecond: 1,
 		CostPerRequest:  2,
 		DenyRetryFloor:  time.Second,
 	})
-	if err == nil {
-		t.Fatal("expected invalid bucket config error")
+	if !errors.Is(err, errInvalidBucketConfig) {
+		t.Fatalf("AllowWithConfig error = %v, want %v", err, errInvalidBucketConfig)
 	}
 }
 
 func TestRateLimiterAllow_RejectsEmptyKey(t *testing.T) {
 	limiter := &RateLimiter{}
 
-	_, err := limiter.Allow(context.Background(), "   ", BucketConfig{
+	_, err := limiter.AllowWithConfig(context.Background(), "   ", BucketConfig{
 		Capacity:        1,
 		RefillPerSecond: 1,
 		CostPerRequest:  1,
 		DenyRetryFloor:  time.Second,
 	})
-	if err == nil {
-		t.Fatal("expected empty key validation error")
+	if !errors.Is(err, errEmptyBucketKey) {
+		t.Fatalf("AllowWithConfig error = %v, want %v", err, errEmptyBucketKey)
+	}
+}
+
+func TestRateLimiterAllow_RejectsInvalidDefaultConfig(t *testing.T) {
+	limiter := &RateLimiter{DefaultConfig: BucketConfig{Capacity: 1, RefillPerSecond: 1, CostPerRequest: 2}}
+
+	_, err := limiter.Allow(context.Background(), "user:a")
+	if !errors.Is(err, errInvalidBucketConfig) {
+		t.Fatalf("Allow error = %v, want %v", err, errInvalidBucketConfig)
 	}
 }
 
 func TestRateLimiterDeleteStaleBuckets_RejectsNonPositiveTTL(t *testing.T) {
 	limiter := &RateLimiter{}
 
-	if _, err := limiter.DeleteStaleBuckets(context.Background(), 0); err == nil {
-		t.Fatal("expected ttl validation error")
+	if _, err := limiter.DeleteStaleBuckets(context.Background(), 0); err == nil || err.Error() != "ttl must be > 0" {
+		t.Fatalf("DeleteStaleBuckets error = %v, want ttl validation error", err)
+	}
+}
+
+func TestNew(t *testing.T) {
+	cfg := BucketConfig{Capacity: 5, RefillPerSecond: 1, CostPerRequest: 1, DenyRetryFloor: time.Second}
+	limiter := New(nil, " tenant_limits ", cfg)
+
+	if limiter == nil {
+		t.Fatal("New returned nil")
+	}
+	if limiter.Schema != " tenant_limits " {
+		t.Fatalf("Schema = %q, want %q", limiter.Schema, " tenant_limits ")
+	}
+	if limiter.DefaultConfig != cfg {
+		t.Fatalf("DefaultConfig = %#v, want %#v", limiter.DefaultConfig, cfg)
 	}
 }
 

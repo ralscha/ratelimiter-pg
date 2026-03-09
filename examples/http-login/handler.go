@@ -23,7 +23,6 @@ type loginResponse struct {
 
 type loginHandler struct {
 	Limiter *ratelimit.RateLimiter
-	Config  ratelimit.BucketConfig
 }
 
 func (h *loginHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -46,7 +45,7 @@ func (h *loginHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	decision, err := h.Limiter.Allow(r.Context(), loginKey(username), h.Config)
+	decision, err := h.Limiter.Allow(r.Context(), loginKey(username))
 	if err != nil {
 		log.Printf("rate limit error: %v", err)
 		h.writeJSON(w, http.StatusInternalServerError, loginResponse{OK: false, Message: "internal error"})

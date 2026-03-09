@@ -21,19 +21,18 @@ func main() {
 	}
 	defer db.Close()
 
-	limiter := &ratelimit.RateLimiter{DB: db, Schema: getenv("DB_SCHEMA", "public")}
+	limiter := ratelimit.New(db, getenv("DB_SCHEMA", "public"), ratelimit.BucketConfig{
+		Capacity:        5,
+		RefillPerSecond: 1.0 / 60.0,
+		CostPerRequest:  1,
+		DenyRetryFloor:  time.Second,
+	})
 	if err := limiter.Init(ctx); err != nil {
 		log.Fatalf("init limiter: %v", err)
 	}
 
 	handler := &loginHandler{
 		Limiter: limiter,
-		Config: ratelimit.BucketConfig{
-			Capacity:        5,
-			RefillPerSecond: 1.0 / 60.0,
-			CostPerRequest:  1,
-			DenyRetryFloor:  time.Second,
-		},
 	}
 
 	mux := http.NewServeMux()
