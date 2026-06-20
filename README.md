@@ -10,6 +10,11 @@ It stores bucket state in PostgreSQL and evaluates each request with one stored 
 go get github.com/ralscha/ratelimiter-pg
 ```
 
+## Requirements
+
+- Go 1.26 or newer, matching the module's `go` directive.
+- PostgreSQL 18 or newer with PL/pgSQL enabled. The embedded migration uses PostgreSQL 18 `RETURNING WITH (OLD AS ..., NEW AS ...)` syntax.
+
 ## Quick start
 
 Call `Init` once during application startup. It is the library's single bootstrap method and prepares the schema for use.
@@ -95,7 +100,6 @@ Minimal request flow:
 - On a database that is already current, `Init` returns without applying changes.
 - Set `RateLimiter.Schema` when you want the limiter objects in a schema other than `public`.
 
-
 ## Examples
 
 Runnable examples live under `examples/`:
@@ -126,6 +130,26 @@ go run ./examples/http-login
 go run ./examples/cleanup
 ```
 
+## Development
+
+Common commands:
+
+```bash
+go fmt ./...
+go vet ./...
+go test ./...
+```
+
+With [Task](https://taskfile.dev/) installed, the same checks are available as:
+
+```bash
+task format
+task vet
+task test
+```
+
+Use `task pg-up` to start the local PostgreSQL container used by the examples, and `task pg-reset` when you want a clean database volume.
+
 ## Key design
 
 The limiter is generic. It accepts any non-empty string key chosen by the caller.
@@ -149,7 +173,7 @@ That makes it suitable for per-user login throttling, per-tenant quotas, per-end
 
 Use `(*RateLimiter).AllowWithConfig` when a specific request should override that default configuration.
 
-That function replenishes tokens lazily from elapsed time and atomically applies the allow-or-deny decision through one `INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING` statement.
+That function replenishes tokens lazily from elapsed time and atomically applies the allow-or-deny decision through one PostgreSQL 18 `INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING WITH (OLD AS ..., NEW AS ...)` statement.
 
 Because the decision is stored and computed in PostgreSQL, competing requests for the same bucket serialize on the same row instead of relying on in-process memory or distributed locks.
 
@@ -190,5 +214,3 @@ The `updated_at` index supports `DeleteStaleBuckets`, which removes rows that ha
 ## Status codes and retries
 
 The library is transport-agnostic. It returns a `Decision` with `Allowed`, `TokensLeft`, and `RetryAfter`, and the caller decides how that maps to HTTP responses, gRPC errors, CLI behavior, or background job scheduling.
-
-

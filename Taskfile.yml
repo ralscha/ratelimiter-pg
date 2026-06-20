@@ -33,6 +33,11 @@ tasks:
     cmds:
       - go test ./...
 
+  vet:
+    desc: Run Go vet
+    cmds:
+      - go vet ./...
+
   format:
     desc: Format Go code
     cmds:
