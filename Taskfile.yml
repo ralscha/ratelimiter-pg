@@ -17,6 +17,13 @@ tasks:
       - docker compose down -v --remove-orphans
       - docker compose up -d --force-recreate postgresql
 
+  build:
+    desc: Build all example programs
+    cmds:
+      - go build -o ratelimiter-basic{{exeExt}} ./examples/basic
+      - go build -o ratelimiter-cleanup{{exeExt}} ./examples/cleanup
+      - go build -o ratelimiter-http-login{{exeExt}} ./examples/http-login
+
   run:
     desc: Run the basic library example
     deps: [pg-up]
