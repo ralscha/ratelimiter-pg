@@ -232,7 +232,7 @@ func TestRateLimiterAllow_ConcurrentFirstHitSingleAllow(t *testing.T) {
 	const workers = 20
 
 	var wg sync.WaitGroup
-	var allowedCount int32
+	var allowedCount atomic.Int32
 	wg.Add(workers)
 	for range workers {
 		go func() {
@@ -243,13 +243,13 @@ func TestRateLimiterAllow_ConcurrentFirstHitSingleAllow(t *testing.T) {
 				return
 			}
 			if decision.Allowed {
-				atomic.AddInt32(&allowedCount, 1)
+				allowedCount.Add(1)
 			}
 		}()
 	}
 	wg.Wait()
 
-	if got := atomic.LoadInt32(&allowedCount); got != 1 {
+	if got := allowedCount.Load(); got != 1 {
 		t.Fatalf("expected exactly one allowed request, got %d", got)
 	}
 }
