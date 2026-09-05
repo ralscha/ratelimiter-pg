@@ -12,8 +12,8 @@ go get github.com/ralscha/ratelimiter-pg
 
 ## Requirements
 
-- Go 1.26 or newer, matching the module's `go` directive.
-- PostgreSQL 18 or newer with PL/pgSQL enabled. The embedded migration uses PostgreSQL 18 `RETURNING WITH (OLD AS ..., NEW AS ...)` syntax.
+- Go 1.27.1 or newer, matching the module's `go` directive.
+- PostgreSQL 18 or newer with PL/pgSQL enabled.
 
 ## Quick start
 
@@ -82,18 +82,21 @@ Minimal request flow:
 - `New` constructs a `RateLimiter` with a PostgreSQL pool, target schema, and default bucket config.
 - `RateLimiter` holds the PostgreSQL pool, target schema, and default bucket config. An empty `Schema` value defaults to `public`.
 - `RateLimiter.DefaultConfig` is the bucket config used by `(*RateLimiter).Allow`.
-- `BucketConfig` defines capacity, refill rate, cost, and deny retry floor. `Capacity`, `RefillPerSecond`, and `CostPerRequest` must be `> 0`, and `CostPerRequest` must not exceed `Capacity`.
+- `BucketConfig` defines capacity, refill rate, cost, and deny retry floor. Call `BucketConfig.Validate` to validate one before use. Floating-point fields must be finite and within PostgreSQL's supported positive range, `CostPerRequest` must not exceed `Capacity`, and `DenyRetryFloor` must fit the whole-millisecond `time.Duration` range.
 - `Decision` reports whether a request was allowed, how many tokens remain, and when to retry.
 - `(*RateLimiter).Init` prepares the limiter for use.
 - `(*RateLimiter).Allow` evaluates one key with the limiter's default bucket config. It trims leading and trailing whitespace from the key and rejects an empty result.
 - `(*RateLimiter).AllowWithConfig` evaluates one key with a call-specific bucket config override.
+- `(*RateLimiter).DeleteBucket` deletes one key's state, so its next request starts with a full bucket.
 - `(*RateLimiter).DeleteStaleBuckets` deletes untouched buckets older than a TTL.
+- Exported sentinel errors such as `ErrInvalidBucketConfig`, `ErrEmptyBucketKey`, and `ErrSchemaTooNew` can be inspected with `errors.Is`.
 
 ## Schema management
 
 `Init` is the only schema/bootstrap method exposed by the library.
 
 - `(*RateLimiter).Init` checks the current schema state and applies pending migrations when needed.
+- Concurrent `Init` calls for the same schema are serialized with a transaction-scoped PostgreSQL advisory lock.
 - On a fresh database, `Init` creates the limiter objects and installs the embedded schema.
 - On an existing but outdated database, `Init` upgrades the limiter schema to the version required by the library.
 - If the database schema version is newer than the library supports, `Init` returns an error instead of downgrading or modifying it.
@@ -173,9 +176,9 @@ That makes it suitable for per-user login throttling, per-tenant quotas, per-end
 
 Use `(*RateLimiter).AllowWithConfig` when a specific request should override that default configuration.
 
-That function replenishes tokens lazily from elapsed time and atomically applies the allow-or-deny decision through one PostgreSQL 18 `INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING WITH (OLD AS ..., NEW AS ...)` statement.
+That function replenishes tokens lazily from elapsed time and atomically applies the allow-or-deny decision while holding a row lock for the bucket. It uses higher-precision intermediate arithmetic to avoid PostgreSQL floating-point underflow and caps retry values at the largest whole-millisecond `time.Duration`.
 
-Because the decision is stored and computed in PostgreSQL, competing requests for the same bucket serialize on the same row instead of relying on in-process memory or distributed locks.
+The Go call still makes one database round trip. Competing requests for the same bucket serialize inside PostgreSQL instead of relying on in-process memory or distributed locks, and unrelated bucket keys do not block each other.
 
 For denied requests it computes:
 
@@ -183,7 +186,7 @@ For denied requests it computes:
 retry_ms = ceil((cost_per_request - replenished) / refill_per_second * 1000)
 ```
 
-The deny retry floor is then applied so very small retry values still surface as a visible delay.
+The deny retry floor is rounded up to whole milliseconds and then applied so very small retry values still surface as a visible delay.
 
 ## Database objects
 

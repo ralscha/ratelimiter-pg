@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -34,6 +35,11 @@ type BucketConfig struct {
 	DenyRetryFloor  time.Duration
 }
 
+// Validate reports whether the bucket configuration can be used by the limiter.
+func (cfg BucketConfig) Validate() error {
+	return validateBucketConfig(cfg)
+}
+
 // Decision is the result of evaluating one request against a bucket.
 type Decision struct {
 	Allowed    bool
@@ -42,9 +48,25 @@ type Decision struct {
 }
 
 var (
-	errInvalidBucketConfig = errors.New("invalid bucket config")
-	errEmptyBucketKey      = errors.New("at least one bucket key is required")
+	// ErrInvalidBucketConfig indicates that a bucket configuration contains an
+	// invalid capacity, refill rate, request cost, or retry floor.
+	ErrInvalidBucketConfig = errors.New("invalid bucket config")
+	// ErrEmptyBucketKey indicates that a bucket key is empty after trimming
+	// leading and trailing whitespace.
+	ErrEmptyBucketKey = errors.New("bucket key is empty")
+	// ErrInvalidTTL indicates that a cleanup TTL is not positive.
+	ErrInvalidTTL = errors.New("ttl must be > 0")
 )
+
+// maxRetryAfterMillis is the largest whole-millisecond duration representable
+// by time.Duration. PostgreSQL calculations are capped to this value.
+const maxRetryAfterMillis int64 = 9_223_372_036_854
+
+const maxRetryAfter = time.Duration(maxRetryAfterMillis) * time.Millisecond
+
+// PostgreSQL reports floating-point underflow below approximately 1e-307,
+// even though Go float64 values can represent smaller subnormal numbers.
+const minPostgresFloat = 1e-307
 
 // Init prepares the limiter for use by applying embedded migrations and
 // verifying schema compatibility.
@@ -54,17 +76,6 @@ func (r *RateLimiter) Init(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
 	}
-
-	version, err := r.schemaVersion(ctx)
-	switch {
-	case err == nil && version == currentSchemaVersion:
-		return nil
-	case err == nil && version > currentSchemaVersion:
-		return fmt.Errorf("%w: database is at version %d, library supports %d", errSchemaTooNew, version, currentSchemaVersion)
-	case err != nil && !errors.Is(err, errSchemaNotInstalled):
-		return err
-	}
-
 	return r.install(ctx)
 }
 
@@ -79,7 +90,7 @@ func (r *RateLimiter) AllowWithConfig(ctx context.Context, key string, cfg Bucke
 	if err != nil {
 		return Decision{}, err
 	}
-	if err := validateBucketConfig(cfg); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return Decision{}, err
 	}
 	if err := r.validate(); err != nil {
@@ -106,18 +117,36 @@ FROM %s($1, $2, $3, $4, $5)
 	}, nil
 }
 
+// DeleteBucket removes the state for key. The next request for the key starts
+// with a full bucket. It reports whether a bucket existed.
+func (r *RateLimiter) DeleteBucket(ctx context.Context, key string) (bool, error) {
+	normalized, err := normalizeBucketKey(key)
+	if err != nil {
+		return false, err
+	}
+	if err := r.validate(); err != nil {
+		return false, err
+	}
+
+	result, err := r.DB.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE bucket_key = $1`, r.schemaQualifiedIdentifier("rate_limit_buckets")), normalized)
+	if err != nil {
+		return false, fmt.Errorf("delete bucket: %w", err)
+	}
+	return result.RowsAffected() > 0, nil
+}
+
 // DeleteStaleBuckets removes bucket rows untouched for longer than ttl.
 func (r *RateLimiter) DeleteStaleBuckets(ctx context.Context, ttl time.Duration) (int64, error) {
 	if ttl <= 0 {
-		return 0, errors.New("ttl must be > 0")
+		return 0, ErrInvalidTTL
 	}
 	if err := r.validate(); err != nil {
 		return 0, err
 	}
 	result, err := r.DB.Exec(ctx, fmt.Sprintf(`
 DELETE FROM %s
-WHERE updated_at < statement_timestamp() - ($1 * INTERVAL '1 millisecond')
-`, r.schemaQualifiedIdentifier("rate_limit_buckets")), ttl.Milliseconds())
+WHERE updated_at < statement_timestamp() - ($1 * INTERVAL '1 microsecond')
+`, r.schemaQualifiedIdentifier("rate_limit_buckets")), durationToCeilMicroseconds(ttl))
 	if err != nil {
 		return 0, fmt.Errorf("cleanup stale buckets: %w", err)
 	}
@@ -128,24 +157,48 @@ func denyRetryFloorMillis(d time.Duration) int64 {
 	if d <= 0 {
 		return 0
 	}
-	ms := d.Milliseconds()
-	if ms == 0 {
-		return 1
+	ms := int64(d / time.Millisecond)
+	if d%time.Millisecond != 0 {
+		ms++
 	}
 	return ms
 }
 
+func durationToCeilMicroseconds(d time.Duration) int64 {
+	micros := int64(d / time.Microsecond)
+	if d%time.Microsecond != 0 {
+		micros++
+	}
+	return micros
+}
+
 func validateBucketConfig(cfg BucketConfig) error {
-	if cfg.Capacity <= 0 || cfg.RefillPerSecond <= 0 || cfg.CostPerRequest <= 0 || cfg.CostPerRequest > cfg.Capacity {
-		return errInvalidBucketConfig
+	if !isPostgresPositiveFloat(cfg.Capacity) {
+		return fmt.Errorf("%w: capacity must be finite and >= %g", ErrInvalidBucketConfig, minPostgresFloat)
+	}
+	if !isPostgresPositiveFloat(cfg.RefillPerSecond) {
+		return fmt.Errorf("%w: refill per second must be finite and >= %g", ErrInvalidBucketConfig, minPostgresFloat)
+	}
+	if !isPostgresPositiveFloat(cfg.CostPerRequest) {
+		return fmt.Errorf("%w: cost per request must be finite and >= %g", ErrInvalidBucketConfig, minPostgresFloat)
+	}
+	if cfg.CostPerRequest > cfg.Capacity {
+		return fmt.Errorf("%w: cost per request must not exceed capacity", ErrInvalidBucketConfig)
+	}
+	if cfg.DenyRetryFloor < 0 || cfg.DenyRetryFloor > maxRetryAfter {
+		return fmt.Errorf("%w: deny retry floor must be between 0 and %s", ErrInvalidBucketConfig, maxRetryAfter)
 	}
 	return nil
+}
+
+func isPostgresPositiveFloat(value float64) bool {
+	return value >= minPostgresFloat && !math.IsInf(value, 0) && !math.IsNaN(value)
 }
 
 func normalizeBucketKey(key string) (string, error) {
 	normalized := strings.TrimSpace(key)
 	if normalized == "" {
-		return "", errEmptyBucketKey
+		return "", ErrEmptyBucketKey
 	}
 	return normalized, nil
 }

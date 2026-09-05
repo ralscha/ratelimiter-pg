@@ -126,12 +126,12 @@ func TestRateLimiterInit_Idempotent(t *testing.T) {
 		t.Fatalf("second init: %v", err)
 	}
 
-	version, err := limiter.schemaVersion(ctx)
-	if err != nil {
+	var version int64
+	if err := limiter.DB.QueryRow(ctx, fmt.Sprintf("SELECT MAX(version) FROM %s", limiter.schemaQualifiedIdentifier("rate_limit_schema_migrations"))).Scan(&version); err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if version != currentSchemaVersionValue() {
-		t.Fatalf("schema version = %d, want %d", version, currentSchemaVersionValue())
+	if version != currentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, currentSchemaVersion)
 	}
 }
 
@@ -167,6 +167,81 @@ func TestRateLimiterInit_CustomSchema(t *testing.T) {
 	}
 
 	_, _ = limiter.DB.Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s", limiter.schemaQualifiedIdentifier("rate_limit_buckets")))
+}
+
+func TestRateLimiterInit_ConcurrentStartup(t *testing.T) {
+	base := setupTestLimiter(t)
+	ctx := context.Background()
+	schema := fmt.Sprintf("ratelimit_concurrent_%d", time.Now().UnixNano())
+
+	const workers = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			limiter := &RateLimiter{DB: base.DB, Schema: schema}
+			errs <- limiter.Init(ctx)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Init: %v", err)
+		}
+	}
+}
+
+func TestRateLimiterInit_RepairsMissingMigrationRecord(t *testing.T) {
+	base := setupTestLimiter(t)
+	ctx := context.Background()
+	limiter := &RateLimiter{DB: base.DB, Schema: fmt.Sprintf("ratelimit_gap_%d", time.Now().UnixNano())}
+
+	if err := limiter.Init(ctx); err != nil {
+		t.Fatalf("initial Init: %v", err)
+	}
+	if _, err := limiter.DB.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE version = 1", limiter.schemaQualifiedIdentifier("rate_limit_schema_migrations"))); err != nil {
+		t.Fatalf("remove migration record: %v", err)
+	}
+	if err := limiter.Init(ctx); err != nil {
+		t.Fatalf("repairing Init: %v", err)
+	}
+
+	var count int
+	if err := limiter.DB.QueryRow(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", limiter.schemaQualifiedIdentifier("rate_limit_schema_migrations"))).Scan(&count); err != nil {
+		t.Fatalf("count migration records: %v", err)
+	}
+	if count != len(schemaMigrations) {
+		t.Fatalf("migration count = %d, want %d", count, len(schemaMigrations))
+	}
+
+	cfg := BucketConfig{Capacity: 1, RefillPerSecond: minPostgresFloat, CostPerRequest: 1}
+	if _, err := limiter.AllowWithConfig(ctx, "gap-check:key", cfg); err != nil {
+		t.Fatalf("first allow after repair: %v", err)
+	}
+	if _, err := limiter.AllowWithConfig(ctx, "gap-check:key", cfg); err != nil {
+		t.Fatalf("second allow after repair: %v", err)
+	}
+}
+
+func TestRateLimiterInit_RejectsNewerSchema(t *testing.T) {
+	base := setupTestLimiter(t)
+	ctx := context.Background()
+	limiter := &RateLimiter{DB: base.DB, Schema: fmt.Sprintf("ratelimit_future_%d", time.Now().UnixNano())}
+
+	if err := limiter.Init(ctx); err != nil {
+		t.Fatalf("initial Init: %v", err)
+	}
+	if _, err := limiter.DB.Exec(ctx, fmt.Sprintf("INSERT INTO %s (version, name) VALUES ($1, $2)", limiter.schemaQualifiedIdentifier("rate_limit_schema_migrations")), currentSchemaVersion+1, "future"); err != nil {
+		t.Fatalf("seed future migration: %v", err)
+	}
+
+	if err := limiter.Init(ctx); !errors.Is(err, ErrSchemaTooNew) {
+		t.Fatalf("Init error = %v, want %v", err, ErrSchemaTooNew)
+	}
 }
 
 func TestRateLimiterAllow_DeniesWhenBucketExhausted(t *testing.T) {
@@ -373,6 +448,48 @@ func TestRateLimiterAllow_UsesDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestRateLimiterAllow_CapsRetryAfter(t *testing.T) {
+	limiter := setupTestLimiter(t)
+	ctx := context.Background()
+	cfg := BucketConfig{
+		Capacity:        1,
+		RefillPerSecond: minPostgresFloat,
+		CostPerRequest:  1,
+	}
+
+	if _, err := limiter.AllowWithConfig(ctx, "slow-refill:key", cfg); err != nil {
+		t.Fatalf("first allow: %v", err)
+	}
+	decision, err := limiter.AllowWithConfig(ctx, "slow-refill:key", cfg)
+	if err != nil {
+		t.Fatalf("second allow: %v", err)
+	}
+	if decision.Allowed {
+		t.Fatal("second call should be denied")
+	}
+	if decision.RetryAfter != maxRetryAfter {
+		t.Fatalf("RetryAfter = %s, want capped value %s", decision.RetryAfter, maxRetryAfter)
+	}
+}
+
+func TestRateLimiterAllow_ClampsSubnormalTokenBalance(t *testing.T) {
+	limiter := setupTestLimiter(t)
+	decision, err := limiter.AllowWithConfig(context.Background(), "small-balance:key", BucketConfig{
+		Capacity:        1.1e-307,
+		RefillPerSecond: 1,
+		CostPerRequest:  minPostgresFloat,
+	})
+	if err != nil {
+		t.Fatalf("AllowWithConfig: %v", err)
+	}
+	if !decision.Allowed {
+		t.Fatal("first call should be allowed")
+	}
+	if decision.TokensLeft != 0 {
+		t.Fatalf("TokensLeft = %g, want subnormal balance clamped to zero", decision.TokensLeft)
+	}
+}
+
 func TestRateLimiterAllowWithConfig_OverridesDefault(t *testing.T) {
 	ctx := context.Background()
 	limiter := setupTestLimiter(t)
@@ -444,5 +561,38 @@ VALUES
 	}
 	if !freshExists {
 		t.Fatal("expected fresh bucket to remain")
+	}
+}
+
+func TestRateLimiterDeleteBucket(t *testing.T) {
+	limiter := setupTestLimiter(t)
+	ctx := context.Background()
+	cfg := BucketConfig{Capacity: 1, RefillPerSecond: 0.001, CostPerRequest: 1}
+
+	if _, err := limiter.AllowWithConfig(ctx, " reset:user ", cfg); err != nil {
+		t.Fatalf("seed bucket: %v", err)
+	}
+	deleted, err := limiter.DeleteBucket(ctx, "reset:user")
+	if err != nil {
+		t.Fatalf("DeleteBucket: %v", err)
+	}
+	if !deleted {
+		t.Fatal("DeleteBucket reported that the existing bucket was missing")
+	}
+
+	deleted, err = limiter.DeleteBucket(ctx, "reset:user")
+	if err != nil {
+		t.Fatalf("second DeleteBucket: %v", err)
+	}
+	if deleted {
+		t.Fatal("second DeleteBucket reported a deletion")
+	}
+
+	decision, err := limiter.AllowWithConfig(ctx, "reset:user", cfg)
+	if err != nil {
+		t.Fatalf("allow after delete: %v", err)
+	}
+	if !decision.Allowed {
+		t.Fatal("request after DeleteBucket should start with a full bucket")
 	}
 }

@@ -7,11 +7,9 @@ import (
 	"fmt"
 	"io/fs"
 	"strings"
-
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
-const currentSchemaVersion int64 = 2
+const currentSchemaVersion int64 = 1
 
 const defaultSchemaName = "public"
 
@@ -31,44 +29,77 @@ type schemaMigration struct {
 
 var schemaMigrations = []schemaMigration{
 	{version: 1, name: "init", file: "sql/001_init.sql"},
-	{version: 2, name: "check_rate_limit_v1", file: "sql/002_check_rate_limit_v1.sql"},
 }
 
 var (
-	errNilDB              = errors.New("rate limiter DB is nil")
-	errInvalidSchema      = errors.New("rate limiter schema is invalid")
-	errSchemaNotInstalled = errors.New("rate limiter schema not installed")
-	errSchemaOutdated     = errors.New("rate limiter schema is outdated")
-	errSchemaTooNew       = errors.New("rate limiter schema is newer than this library")
+	// ErrNilDB indicates that a limiter has no PostgreSQL pool.
+	ErrNilDB = errors.New("rate limiter DB is nil")
+	// ErrInvalidSchema indicates that a schema name cannot be represented as a
+	// PostgreSQL identifier.
+	ErrInvalidSchema = errors.New("rate limiter schema is invalid")
+	// ErrSchemaTooNew indicates that the database was initialized by a newer library version.
+	ErrSchemaTooNew = errors.New("rate limiter schema is newer than this library")
 )
 
 //go:embed sql/*.sql
 var migrationFiles embed.FS
-
-func currentSchemaVersionValue() int64 {
-	return currentSchemaVersion
-}
 
 func (r *RateLimiter) install(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
 	}
 
-	if _, err := r.DB.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", r.quotedSchemaName())); err != nil {
+	tx, err := r.DB.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin schema initialization: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	lockName := "github.com/ralscha/ratelimiter-pg:" + r.schemaName()
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", lockName); err != nil {
+		return fmt.Errorf("lock schema initialization: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", r.quotedSchemaName())); err != nil {
 		return fmt.Errorf("ensure schema %q: %w", r.schemaName(), err)
 	}
 
-	if _, err := r.DB.Exec(ctx, fmt.Sprintf(createSchemaMigrationsTableSQLTemplate, r.schemaQualifiedIdentifier("rate_limit_schema_migrations"))); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf(createSchemaMigrationsTableSQLTemplate, r.schemaQualifiedIdentifier("rate_limit_schema_migrations"))); err != nil {
 		return fmt.Errorf("ensure schema migrations table: %w", err)
 	}
 
-	applied, err := r.appliedMigrationVersions(ctx)
+	rows, err := tx.Query(ctx, fmt.Sprintf("SELECT version FROM %s", r.schemaQualifiedIdentifier("rate_limit_schema_migrations")))
 	if err != nil {
-		return err
+		return fmt.Errorf("list applied migrations: %w", err)
 	}
 
+	applied := make(map[int64]bool, len(schemaMigrations))
+	for rows.Next() {
+		var version int64
+		if err := rows.Scan(&version); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan applied migration version: %w", err)
+		}
+		if version > currentSchemaVersion {
+			rows.Close()
+			return fmt.Errorf("%w: database is at version %d, library supports %d", ErrSchemaTooNew, version, currentSchemaVersion)
+		}
+		applied[version] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate applied migrations: %w", err)
+	}
+	rows.Close()
+
+	replay := false
 	for _, migration := range schemaMigrations {
-		if applied[migration.version] {
+		if !applied[migration.version] {
+			replay = true
+		}
+		if !replay {
 			continue
 		}
 
@@ -78,13 +109,7 @@ func (r *RateLimiter) install(ctx context.Context) error {
 		}
 		rendered := r.renderMigrationSQL(string(body))
 
-		tx, err := r.DB.Begin(ctx)
-		if err != nil {
-			return fmt.Errorf("begin migration %d (%s): %w", migration.version, migration.name, err)
-		}
-
 		if _, err := tx.Exec(ctx, rendered); err != nil {
-			_ = tx.Rollback(ctx)
 			return fmt.Errorf("apply migration %d (%s): %w", migration.version, migration.name, err)
 		}
 
@@ -93,89 +118,22 @@ INSERT INTO %s (version, name)
 VALUES ($1, $2)
 ON CONFLICT (version) DO NOTHING
 `, r.schemaQualifiedIdentifier("rate_limit_schema_migrations")), migration.version, migration.name); err != nil {
-			_ = tx.Rollback(ctx)
 			return fmt.Errorf("record migration %d (%s): %w", migration.version, migration.name, err)
 		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit migration %d (%s): %w", migration.version, migration.name, err)
-		}
 	}
 
-	return r.checkSchema(ctx)
-}
-
-func (r *RateLimiter) checkSchema(ctx context.Context) error {
-	if err := r.validate(); err != nil {
-		return err
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit schema initialization: %w", err)
 	}
-
-	version, err := r.schemaVersion(ctx)
-	if err != nil {
-		return err
-	}
-
-	switch {
-	case version == 0:
-		return fmt.Errorf("%w: run migrations through version %d", errSchemaNotInstalled, currentSchemaVersion)
-	case version < currentSchemaVersion:
-		return fmt.Errorf("%w: database is at version %d, library requires %d", errSchemaOutdated, version, currentSchemaVersion)
-	case version > currentSchemaVersion:
-		return fmt.Errorf("%w: database is at version %d, library supports %d", errSchemaTooNew, version, currentSchemaVersion)
-	default:
-		return nil
-	}
-}
-
-func (r *RateLimiter) schemaVersion(ctx context.Context) (int64, error) {
-	if err := r.validate(); err != nil {
-		return 0, err
-	}
-
-	var version int64
-	err := r.DB.QueryRow(ctx, fmt.Sprintf(`
-SELECT COALESCE(MAX(version), 0)
-FROM %s
-`, r.schemaQualifiedIdentifier("rate_limit_schema_migrations"))).Scan(&version)
-	if err != nil {
-		if isUndefinedTable(err) {
-			return 0, fmt.Errorf("%w: migration metadata table is missing", errSchemaNotInstalled)
-		}
-		return 0, fmt.Errorf("read schema version: %w", err)
-	}
-
-	return version, nil
-}
-
-func (r *RateLimiter) appliedMigrationVersions(ctx context.Context) (map[int64]bool, error) {
-	rows, err := r.DB.Query(ctx, fmt.Sprintf("SELECT version FROM %s", r.schemaQualifiedIdentifier("rate_limit_schema_migrations")))
-	if err != nil {
-		return nil, fmt.Errorf("list applied migrations: %w", err)
-	}
-	defer rows.Close()
-
-	applied := make(map[int64]bool, len(schemaMigrations))
-	for rows.Next() {
-		var version int64
-		if err := rows.Scan(&version); err != nil {
-			return nil, fmt.Errorf("scan applied migration version: %w", err)
-		}
-		applied[version] = true
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate applied migrations: %w", err)
-	}
-
-	return applied, nil
+	return nil
 }
 
 func (r *RateLimiter) validate() error {
 	if r == nil || r.DB == nil {
-		return errNilDB
+		return ErrNilDB
 	}
 	if strings.ContainsRune(r.schemaName(), 0) {
-		return errInvalidSchema
+		return ErrInvalidSchema
 	}
 	return nil
 }
@@ -201,14 +159,19 @@ func (r *RateLimiter) schemaQualifiedIdentifier(name string) string {
 }
 
 func (r *RateLimiter) renderMigrationSQL(sql string) string {
-	return strings.ReplaceAll(sql, "{{schema}}", r.quotedSchemaName())
+	delimiter := ""
+	for suffix := 0; ; suffix++ {
+		candidate := fmt.Sprintf("$ratelimiter_%d$", suffix)
+		if !strings.Contains(sql, candidate) && !strings.Contains(r.schemaName(), candidate) {
+			delimiter = candidate
+			break
+		}
+	}
+
+	rendered := strings.ReplaceAll(sql, "{{delimiter}}", delimiter)
+	return strings.ReplaceAll(rendered, "{{schema}}", r.quotedSchemaName())
 }
 
 func quoteIdentifier(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
-}
-
-func isUndefinedTable(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
 }
